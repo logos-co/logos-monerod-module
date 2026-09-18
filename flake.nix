@@ -3,9 +3,8 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
-    # TODO: github:logos-co/logos-monero-nix once that repo is published.
     logos-monero-nix = {
-      url = "git+file:///Users/dlipicar/repos/logos-monero-nix";
+      url = "github:logos-co/logos-monero-nix";
       inputs.logos-nix.follows = "logos-module-builder/logos-nix";
       inputs.nixpkgs.follows = "logos-module-builder/nixpkgs";
     };

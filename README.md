@@ -1,7 +1,7 @@
 # logos-monerod-module
 
 `monerod_module` runs a Monero node **in-process**, through `libmonerod_c` from
-[logos-monero-nix](../logos-monero-nix). No executable is bundled and no subprocess is
+[logos-monero-nix](https://github.com/logos-co/logos-monero-nix). No executable is bundled and no subprocess is
 spawned; the node lives and dies with this module.
 
 ```bash

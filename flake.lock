@@ -4090,11 +4090,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1789730112,
-        "narHash": "sha256-9JdMYh2hZDgHm6TVvk7rHU1Tqxtxx8niwLWKDPsMII4=",
+        "lastModified": 1789743157,
+        "narHash": "sha256-oc4Ui8eJRgSH1Up+Qo/ZM6tFUZ3DPp/SCYswj/h/OnM=",
         "ref": "refs/heads/main",
-        "rev": "3362744d03b5cb1e1d341995fa944dca8d006b65",
-        "revCount": 12,
+        "rev": "e0dbaacae42fb19a3ac59431389a54123912fceb",
+        "revCount": 14,
         "type": "git",
         "url": "file:///Users/dlipicar/repos/logos-monero-nix"
       },

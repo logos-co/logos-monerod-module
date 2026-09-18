@@ -1,0 +1,65 @@
+name: monerod_module — a Monero node running inside its module host
+project_name: logos-monerod-module
+
+# Builds are flake URLs, not a bare `nix build`: the harness runs each step in a throwaway
+# directory. CI pins {release} to the commit under test with --release-for.
+#
+# POSIX sh: the harness runs steps under /bin/sh, which is dash on the Linux runner.
+#
+# Only what CI can promise is asserted: the node starts and serves RPC on loopback, stops,
+# restarts in the same process, and stops again from aboutToUnload. Syncing needs stagenet peers,
+# which take anywhere from seconds to minutes to appear, so the run reports height without
+# gating on it.
+
+intro: |
+  `monerod_module` runs Monero's daemon as a library inside the module's own host process: no
+  executable ships and no subprocess is spawned. This loads it into a headless daemon, starts a
+  stagenet node, restarts it, and unloads the module while the node runs.
+
+sections:
+  - title: "Build the module and the runtime"
+    steps:
+      - title: "Build"
+        run: |
+          set -eu
+          nix build 'github:logos-co/logos-logoscore-cli{release}#cli-bundle-dir' --out-link ./logos
+          nix build 'github:logos-co/logos-monerod-module{release}#install-portable' --no-write-lock-file -o result-monerod
+          ls result-monerod/modules/monerod_module
+        code_block: |
+          nix build 'github:logos-co/logos-logoscore-cli#cli-bundle-dir' --out-link ./logos
+          nix build 'github:logos-co/logos-monerod-module#install-portable' -o result-monerod
+        expect_contains: ["monerod_module_plugin", "LICENSE.monero", "LICENSE.monero_c"]
+
+  - title: "Run a stagenet node in the module host"
+    steps:
+      - title: "Start, serve RPC, stop, restart, then unload while running"
+        # status() merges the library's own state with get_info over loopback, so a height of 1
+        # or more means the in-process RPC server answered.
+        run: |
+          set -eu
+          export LOGOSCORE_CONFIG_DIR="$PWD/session"
+          rm -rf "$LOGOSCORE_CONFIG_DIR"; mkdir -p "$LOGOSCORE_CONFIG_DIR"
+          ./logos/bin/logoscore -m ./result-monerod/modules \
+            --persistence-path "$LOGOSCORE_CONFIG_DIR/data" daemon > daemon.log 2>&1 &
+          for i in $(seq 1 60); do
+            if grep -q 'Local client config' daemon.log; then break; fi
+            sleep 1
+          done
+          ./logos/bin/logoscore load-module monerod_module
+          ./logos/bin/logoscore call monerod_module start stagenet
+          for i in $(seq 1 30); do
+            s=$(./logos/bin/logoscore call monerod_module status)
+            case "$s" in *'"height":0'*) sleep 2;; *) break;; esac
+          done
+          echo "$s"
+          ./logos/bin/logoscore call monerod_module stop
+          ./logos/bin/logoscore call monerod_module start stagenet
+          sleep 5
+          ./logos/bin/logoscore unload-module monerod_module
+          cat "$(find "$LOGOSCORE_CONFIG_DIR" -name unload.log | head -1)"
+          ./logos/bin/logoscore stop
+        expect_contains:
+          - '"state":"running"'
+          - '"rpcUrl":"http://127.0.0.1:38081"'
+          - 'aboutToUnload: stopping node'
+          - 'aboutToUnload: node stopped in'

@@ -1,5 +1,6 @@
 #include "loopback_http.h"
 
+#include <cstdint>
 #include <cstring>
 #include <string>
 

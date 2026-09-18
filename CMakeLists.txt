@@ -28,3 +28,8 @@ logos_module(
 if(NOT APPLE AND NOT WIN32)
     target_link_libraries(monerod_module_module_plugin PRIVATE stdc++ m pthread)
 endif()
+
+# loopback_http.cpp talks winsock on Windows.
+if(WIN32)
+    target_link_libraries(monerod_module_module_plugin PRIVATE ws2_32)
+endif()

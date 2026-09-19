@@ -1,5 +1,8 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -37,8 +40,10 @@ public:
     ///   "rpcUrl": string, "uptimeSecs": number, "dataDir": string, "version": string,
     ///   "lastError": string, "height": number, "targetHeight": number,
     ///   "synchronized": bool, "peersOut": number, "peersIn": number,
-    ///   "databaseSize": string }
+    ///   "databaseSize": string, "chainAgeSecs": number }
     /// @endcode
+    /// Never waits on the node: the chain fields come from its last get_info answer,
+    /// `chainAgeSecs` old (-1 before the first).
     LogosMap status();
 
     /// Loopback RPC URL the node serves for `network`.
@@ -60,10 +65,22 @@ private:
     void persist();
     void emitState();
     void unloadLog(const std::string& line);
+    void pollChain();
+    void resetChain();
 
     std::mutex m_mutex;
     std::thread m_stopThread;
     std::string m_persistDir;
     std::string m_logFile;
     nlohmann::json m_config = nlohmann::json::object();
+
+    // get_info waits on monerod's block-batch locks, for seconds while it syncs, so a
+    // thread polls it and status() serves the last answer.
+    std::thread m_chainThread;
+    std::atomic<bool> m_chainStop{false};
+    std::mutex m_chainMutex;
+    std::condition_variable m_chainWake;
+    nlohmann::json m_chain;                            // guarded by m_chainMutex
+    std::chrono::steady_clock::time_point m_chainAt;   // guarded by m_chainMutex
+    uint64_t m_chainGen = 0;                           // guarded; bumped when the node starts or stops
 };

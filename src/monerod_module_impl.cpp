@@ -1,6 +1,7 @@
 #include "monerod_module_impl.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -37,10 +38,45 @@ void appendLine(const std::string& path, const std::string& line) {
 
 }  // namespace
 
-MonerodModuleImpl::MonerodModuleImpl() = default;
+// Started in the body: the thread uses members that are declared after it.
+MonerodModuleImpl::MonerodModuleImpl() { m_chainThread = std::thread([this] { pollChain(); }); }
 MonerodModuleImpl::~MonerodModuleImpl() {
+    { std::lock_guard<std::mutex> lock(m_chainMutex); m_chainStop = true; }
+    m_chainWake.notify_all();
+    if (m_chainThread.joinable()) m_chainThread.join();
     if (m_stopThread.joinable()) m_stopThread.join();
     MONEROD_stop();
+}
+
+void MonerodModuleImpl::pollChain() {
+    std::unique_lock<std::mutex> lock(m_chainMutex);
+    while (!m_chainStop) {
+        const uint64_t gen = m_chainGen;
+        lock.unlock();
+        json chain;
+        const json st = json::parse(takeString(MONEROD_status_json()), nullptr, false);
+        const std::string url = st.is_object() && st.value("state", "") == "running"
+                                    ? st.value("rpcUrl", "") : "";
+        const auto colon = url.rfind(':');
+        if (colon != std::string::npos) {
+            const json r = json::parse(loopbackPost(std::atoi(url.c_str() + colon + 1), "/json_rpc",
+                R"({"jsonrpc":"2.0","id":"0","method":"get_info"})", 30000, &m_chainStop), nullptr, false);
+            if (r.is_object() && r.contains("result") && r["result"].is_object()) chain = r["result"];
+        }
+        lock.lock();
+        if (gen == m_chainGen && !chain.is_null()) {
+            m_chain = std::move(chain);
+            m_chainAt = std::chrono::steady_clock::now();
+        }
+        m_chainWake.wait_for(lock, std::chrono::seconds(1), [this] { return m_chainStop.load(); });
+    }
+}
+
+// A new run must not show the last run's chain, nor keep an answer that was in flight.
+void MonerodModuleImpl::resetChain() {
+    std::lock_guard<std::mutex> lock(m_chainMutex);
+    m_chain = nullptr;
+    ++m_chainGen;
 }
 
 void MonerodModuleImpl::onContextReady() {
@@ -174,6 +210,7 @@ StdLogosResult MonerodModuleImpl::start(const std::string& network) {
         if (!s["proxy"].get<std::string>().empty())
             argv.push_back("--proxy=" + s["proxy"].get<std::string>());
     }
+    resetChain();
     if (MONEROD_start(argv.dump().c_str()) != 0)
         return fail(takeString(MONEROD_last_error()));
     emitState();
@@ -182,6 +219,7 @@ StdLogosResult MonerodModuleImpl::start(const std::string& network) {
 
 StdLogosResult MonerodModuleImpl::stop() {
     MONEROD_stop();
+    resetChain();
     emitState();
     return {true, status()};
 }
@@ -198,17 +236,14 @@ LogosMap MonerodModuleImpl::status() {
     if (!st.is_object()) st = json{{"state", "failed"}, {"lastError", "unreadable status"}};
     st.erase("argv");
     st["height"] = 0; st["targetHeight"] = 0; st["synchronized"] = false;
-    st["peersOut"] = 0; st["peersIn"] = 0; st["databaseSize"] = "0";
+    st["peersOut"] = 0; st["peersIn"] = 0; st["databaseSize"] = "0"; st["chainAgeSecs"] = -1;
     if (st.value("state", "") != "running") return st;
 
-    const std::string url = st.value("rpcUrl", "");
-    const auto colon = url.rfind(':');
-    if (colon == std::string::npos) return st;
-    const std::string body = loopbackPost(std::stoi(url.substr(colon + 1)), "/json_rpc",
-        R"({"jsonrpc":"2.0","id":"0","method":"get_info"})", 3000);
-    const json r = json::parse(body, nullptr, false);
-    if (!r.is_object() || !r.contains("result")) return st;
-    const json& info = r["result"];
+    std::lock_guard<std::mutex> lock(m_chainMutex);
+    if (!m_chain.is_object()) return st;
+    const json& info = m_chain;
+    st["chainAgeSecs"] = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - m_chainAt).count();
     st["height"] = info.value("height", 0);
     st["targetHeight"] = info.value("target_height", 0);
     st["synchronized"] = info.value("synchronized", false);

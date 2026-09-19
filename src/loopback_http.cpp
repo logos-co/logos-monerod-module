@@ -1,5 +1,8 @@
 #include "loopback_http.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -10,18 +13,22 @@
 using sock_t = SOCKET;
 static void closeSock(sock_t s) { closesocket(s); }
 static bool sockValid(sock_t s) { return s != INVALID_SOCKET; }
+static int waitReadable(sock_t s, int ms) { WSAPOLLFD p{s, POLLRDNORM, 0}; return WSAPoll(&p, 1, ms); }
 #else
 #  include <arpa/inet.h>
 #  include <netinet/in.h>
+#  include <poll.h>
 #  include <sys/socket.h>
 #  include <sys/time.h>
 #  include <unistd.h>
 using sock_t = int;
 static void closeSock(sock_t s) { ::close(s); }
 static bool sockValid(sock_t s) { return s >= 0; }
+static int waitReadable(sock_t s, int ms) { pollfd p{s, POLLIN, 0}; return ::poll(&p, 1, ms); }
 #endif
 
-std::string loopbackPost(int port, const std::string& path, const std::string& body, int timeoutMs) {
+std::string loopbackPost(int port, const std::string& path, const std::string& body, int timeoutMs,
+                         const std::atomic<bool>* cancel) {
 #ifdef _WIN32
     static const bool wsaReady = [] { WSADATA d; return WSAStartup(MAKEWORD(2, 2), &d) == 0; }();
     if (!wsaReady) return {};
@@ -34,7 +41,6 @@ std::string loopbackPost(int port, const std::string& path, const std::string& b
 #else
     timeval tv{timeoutMs / 1000, (timeoutMs % 1000) * 1000};
 #endif
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof tv);
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof tv);
 
     sockaddr_in addr{};
@@ -48,9 +54,17 @@ std::string loopbackPost(int port, const std::string& path, const std::string& b
         "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
     if (::send(s, req.data(), static_cast<int>(req.size()), 0) != static_cast<int>(req.size())) { closeSock(s); return {}; }
 
+    // The wait is in slices, so a cancel lands within one.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
     std::string resp;
     char buf[4096];
     for (;;) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (left <= 0 || (cancel && cancel->load())) { closeSock(s); return {}; }
+        const int ready = waitReadable(s, static_cast<int>(std::min<long long>(left, 200)));
+        if (ready == 0 || (ready < 0 && errno == EINTR)) continue;
+        if (ready < 0) break;
         const auto n = ::recv(s, buf, sizeof buf, 0);
         if (n <= 0) break;
         resp.append(buf, static_cast<size_t>(n));

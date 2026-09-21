@@ -52,21 +52,39 @@ void MonerodModuleImpl::pollChain() {
     std::unique_lock<std::mutex> lock(m_chainMutex);
     while (!m_chainStop) {
         const uint64_t gen = m_chainGen;
+        const std::string knownTip = m_tipHash;
         lock.unlock();
         json chain;
+        std::string tipHash;
+        uint64_t tipTime = 0;
         const json st = json::parse(takeString(MONEROD_status_json()), nullptr, false);
         const std::string url = st.is_object() && st.value("state", "") == "running"
                                     ? st.value("rpcUrl", "") : "";
         const auto colon = url.rfind(':');
         if (colon != std::string::npos) {
-            const json r = json::parse(loopbackPost(std::atoi(url.c_str() + colon + 1), "/json_rpc",
+            const int port = std::atoi(url.c_str() + colon + 1);
+            const json r = json::parse(loopbackPost(port, "/json_rpc",
                 R"({"jsonrpc":"2.0","id":"0","method":"get_info"})", 30000, &m_chainStop), nullptr, false);
             if (r.is_object() && r.contains("result") && r["result"].is_object()) chain = r["result"];
+            // Only once the top block has moved: a stalled chain must not cost a second call.
+            if (chain.is_object() && chain.value("top_block_hash", std::string{}) != knownTip) {
+                const json b = json::parse(loopbackPost(port, "/json_rpc",
+                    R"({"jsonrpc":"2.0","id":"0","method":"get_last_block_header"})", 30000, &m_chainStop),
+                    nullptr, false);
+                if (b.is_object() && b.contains("result") && b["result"].is_object()
+                    && b["result"].contains("block_header") && b["result"]["block_header"].is_object()) {
+                    const json& hdr = b["result"]["block_header"];
+                    tipHash = hdr.value("hash", std::string{});
+                    tipTime = hdr.value("timestamp", uint64_t{0});
+                }
+            }
         }
         lock.lock();
         if (gen == m_chainGen && !chain.is_null()) {
             m_chain = std::move(chain);
             m_chainAt = std::chrono::steady_clock::now();
+            // Both read off one header, so the pair holds even if a block landed mid-poll.
+            if (tipTime && !tipHash.empty()) { m_tipTime = tipTime; m_tipHash = tipHash; }
         }
         m_chainWake.wait_for(lock, std::chrono::seconds(1), [this] { return m_chainStop.load(); });
     }
@@ -76,6 +94,8 @@ void MonerodModuleImpl::pollChain() {
 void MonerodModuleImpl::resetChain() {
     std::lock_guard<std::mutex> lock(m_chainMutex);
     m_chain = nullptr;
+    m_tipTime = 0;
+    m_tipHash.clear();
     ++m_chainGen;
 }
 
@@ -237,6 +257,7 @@ LogosMap MonerodModuleImpl::status() {
     st.erase("argv");
     st["height"] = 0; st["targetHeight"] = 0; st["synchronized"] = false;
     st["peersOut"] = 0; st["peersIn"] = 0; st["databaseSize"] = "0"; st["chainAgeSecs"] = -1;
+    st["tipAgeSecs"] = -1;
     if (st.value("state", "") != "running") return st;
 
     std::lock_guard<std::mutex> lock(m_chainMutex);
@@ -251,6 +272,13 @@ LogosMap MonerodModuleImpl::status() {
     st["peersIn"] = info.value("incoming_connections_count", 0);
     // u64: a JSON number loses precision past 2^53, so it crosses as a string.
     st["databaseSize"] = std::to_string(info.value("database_size", uint64_t{0}));
+    if (m_tipTime) {
+        const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        // A block may carry a slightly future timestamp; never report a negative age.
+        const int64_t tip = static_cast<int64_t>(m_tipTime);
+        st["tipAgeSecs"] = now > tip ? now - tip : 0;
+    }
     return st;
 }
 

@@ -40,10 +40,12 @@ public:
     ///   "rpcUrl": string, "uptimeSecs": number, "dataDir": string, "version": string,
     ///   "lastError": string, "height": number, "targetHeight": number,
     ///   "synchronized": bool, "peersOut": number, "peersIn": number,
-    ///   "databaseSize": string, "chainAgeSecs": number }
+    ///   "databaseSize": string, "chainAgeSecs": number, "tipAgeSecs": number }
     /// @endcode
     /// Never waits on the node: the chain fields come from its last get_info answer,
-    /// `chainAgeSecs` old (-1 before the first).
+    /// `chainAgeSecs` old (-1 before the first). `tipAgeSecs` is how far the top block's
+    /// own timestamp lags the clock (-1 until one is known): `synchronized` stays true
+    /// with no peers, so it is the only field separating a stalled chain from a current one.
     LogosMap status();
 
     /// Loopback RPC URL the node serves for `network`.
@@ -83,4 +85,6 @@ private:
     nlohmann::json m_chain;                            // guarded by m_chainMutex
     std::chrono::steady_clock::time_point m_chainAt;   // guarded by m_chainMutex
     uint64_t m_chainGen = 0;                           // guarded; bumped when the node starts or stops
+    uint64_t m_tipTime = 0;                            // guarded; unix seconds of m_tipHash, 0 = unknown
+    std::string m_tipHash;                             // guarded; the block m_tipTime came from
 };

@@ -22,6 +22,13 @@ us, so a node that loses every peer keeps reporting it while its chain goes stal
 `tipAgeSecs` is what tells the two apart. It stays `-1` through the initial sync, because
 `get_last_block_header` answers with a zeroed header until the node is synchronized.
 
+It builds as a plain module (`"transport": "qt_remote_plain"`), so it runs in
+`logos_host_plain` and another runtime can use it. A `logosctl` daemon exports it with
+`peering: { exports: { enabled: true, modules: { monerod_module: { events: true } } } }`,
+and a linked Basecamp imports it under Settings → Peering; every call and
+`monerodStateChanged` then reach the daemon's node
+([logos-peering](https://github.com/logos-co/logos-peering)).
+
 On unload the node is stopped asynchronously and the outcome is written to
 `unload.log` in the instance directory. A node killed mid-flush resumes from its last
 committed height: the chain is LMDB, which is crash-safe.

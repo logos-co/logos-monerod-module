@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "core",
   "interface": "universal",
+  "transport": "qt_remote_plain",
   "concurrency": "multi",
   "category": "wallet",
   "description": "Runs a Monero node in-process: per-network config, start, stop, status and log tail.",

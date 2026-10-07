@@ -2,7 +2,7 @@
   description = "Logos monerod_module: a Monero node, in-process.";
 
   inputs = {
-    logos-module-builder.url = "github:logos-co/logos-module-builder";
+    logos-module-builder.url = "github:logos-co/logos-module-builder/feat/peering";
     logos-monero-nix = {
       url = "github:logos-co/logos-monero-nix";
       inputs.logos-nix.follows = "logos-module-builder/logos-nix";

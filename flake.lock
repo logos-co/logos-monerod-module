@@ -4090,11 +4090,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1791386279,
-        "narHash": "sha256-HengjaXSqRoS6nUJTHaOdjq+1C65EXjD7pnWmeg7neg=",
+        "lastModified": 1791388275,
+        "narHash": "sha256-tu2Cc1Zf8QvrztCP8kRy3O16x2QpjJbLXDBzGXMyVkY=",
         "owner": "logos-co",
         "repo": "logos-monero-nix",
-        "rev": "682fa053609b29416789fbe73eba57cc06cd6cd3",
+        "rev": "5f7ee441d0e3b823b423117d18750352ab68b0ff",
         "type": "github"
       },
       "original": {

@@ -1,7 +1,7 @@
 {
   "name": "monerod_module",
   "display_name": "Monero Node (local)",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "core",
   "interface": "universal",
   "concurrency": "multi",

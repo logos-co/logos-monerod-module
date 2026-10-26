@@ -22,11 +22,11 @@ sections:
       - title: "Build"
         run: |
           set -eu
-          nix build 'github:logos-co/logos-logoscore-cli{release}#cli-bundle-dir' --out-link ./logos
+          nix build 'github:logos-co/logos-logoscore-cli{release}#ctl-bundle-dir' --out-link ./logos
           nix build 'github:logos-co/logos-monerod-module{release}#install-portable' --no-write-lock-file -o result-monerod
           ls result-monerod/modules/monerod_module
         code_block: |
-          nix build 'github:logos-co/logos-logoscore-cli#cli-bundle-dir' --out-link ./logos
+          nix build 'github:logos-co/logos-logoscore-cli#ctl-bundle-dir' --out-link ./logos
           nix build 'github:logos-co/logos-monerod-module#install-portable' -o result-monerod
         expect_contains: ["monerod_module_plugin", "LICENSE.monero", "LICENSE.monero_c"]
 
@@ -37,27 +37,23 @@ sections:
         # or more means the in-process RPC server answered.
         run: |
           set -eu
-          export LOGOSCORE_CONFIG_DIR="$PWD/session"
-          rm -rf "$LOGOSCORE_CONFIG_DIR"; mkdir -p "$LOGOSCORE_CONFIG_DIR"
-          ./logos/bin/logoscore -m ./result-monerod/modules \
-            --persistence-path "$LOGOSCORE_CONFIG_DIR/data" daemon > daemon.log 2>&1 &
-          for i in $(seq 1 60); do
-            if grep -q 'Local client config' daemon.log; then break; fi
-            sleep 1
-          done
-          ./logos/bin/logoscore load-module monerod_module
-          ./logos/bin/logoscore call monerod_module start stagenet
+          export LOGOSCTL_CONFIG_DIR="$PWD/session"
+          rm -rf "$LOGOSCTL_CONFIG_DIR"; mkdir -p "$LOGOSCTL_CONFIG_DIR" home
+          printf 'modules_dirs: [%s]\n' "$PWD/result-monerod/modules" | ./logos/bin/logosctl daemon config set - > /dev/null
+          HOME="$PWD/home" ./logos/bin/logosctl daemon start --detach
+          ./logos/bin/logosctl module load monerod_module
+          ./logos/bin/logosctl call monerod_module start stagenet
           for i in $(seq 1 30); do
-            s=$(./logos/bin/logoscore call monerod_module status)
+            s=$(./logos/bin/logosctl call monerod_module status)
             case "$s" in *'"height":0'*) sleep 2;; *) break;; esac
           done
           echo "$s"
-          ./logos/bin/logoscore call monerod_module stop
-          ./logos/bin/logoscore call monerod_module start stagenet
+          ./logos/bin/logosctl call monerod_module stop
+          ./logos/bin/logosctl call monerod_module start stagenet
           sleep 5
-          ./logos/bin/logoscore unload-module monerod_module
-          cat "$(find "$LOGOSCORE_CONFIG_DIR" -name unload.log | head -1)"
-          ./logos/bin/logoscore stop
+          ./logos/bin/logosctl module unload monerod_module
+          cat "$(find "$LOGOSCTL_CONFIG_DIR" -name unload.log | head -1)"
+          ./logos/bin/logosctl daemon stop
         expect_contains:
           - '"state":"running"'
           - '"rpcUrl":"http://127.0.0.1:38081"'

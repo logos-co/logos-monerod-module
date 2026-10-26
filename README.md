@@ -5,11 +5,11 @@
 spawned; the node lives and dies with this module.
 
 ```bash
-logoscore call monerod_module configure stagenet 'json:{"pruneBlockchain":false}'
-logoscore call monerod_module start stagenet
-logoscore call monerod_module status        # state, height, targetHeight, peers, ...
-logoscore call monerod_module logTail 50
-logoscore call monerod_module stop
+logosctl call monerod_module configure stagenet 'json:{"pruneBlockchain":false}'
+logosctl call monerod_module start stagenet
+logosctl call monerod_module status        # state, height, targetHeight, peers, ...
+logosctl call monerod_module logTail 50
+logosctl call monerod_module stop
 ```
 
 Settings are per network (`mainnet`, `stagenet`, `testnet`) and persisted in the

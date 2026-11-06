@@ -59,3 +59,28 @@ sections:
           - '"rpcUrl":"http://127.0.0.1:38081"'
           - 'aboutToUnload: stopping node'
           - 'aboutToUnload: node stopped in'
+
+  - title: "Transactions over Tor"
+    steps:
+      - title: "txProxy is on for mainnet, refused elsewhere, and unavailable without tor_module"
+        # Offline and on spare ports, so nothing leaves the runner. tor_module is not staged: the
+        # node must start without --tx-proxy and say why rather than refuse to start.
+        run: |
+          set -eu
+          export LOGOSCTL_CONFIG_DIR="$PWD/session-tx"
+          rm -rf "$LOGOSCTL_CONFIG_DIR" chain-tx; mkdir -p "$LOGOSCTL_CONFIG_DIR" home chain-tx
+          printf 'modules_dirs: [%s]\n' "$PWD/result-monerod/modules" | ./logos/bin/logosctl daemon config set - > /dev/null
+          HOME="$PWD/home" ./logos/bin/logosctl daemon start --detach
+          trap './logos/bin/logosctl daemon stop > /dev/null 2>&1 || true' EXIT
+          ./logos/bin/logosctl module load monerod_module
+          ./logos/bin/logosctl call monerod_module getConfig mainnet
+          ./logos/bin/logosctl call monerod_module configure stagenet 'json:{"txProxy":true}'
+          ./logos/bin/logosctl call monerod_module configure mainnet \
+            "json:{\"offline\":true,\"rpcBindPort\":18991,\"p2pBindPort\":18990,\"dataDir\":\"$PWD/chain-tx\"}"
+          ./logos/bin/logosctl call monerod_module start mainnet
+          ./logos/bin/logosctl call monerod_module stop
+        expect_contains:
+          - '"txProxy":true'
+          - 'txProxy is mainnet-only: monerod knows no Tor peers on stagenet'
+          - '"txProxy":"unavailable"'
+          - '"txProxyReason":"tor_module is not loaded"'

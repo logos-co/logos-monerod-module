@@ -17,6 +17,8 @@ logos_module(
     SOURCES
         src/monerod_module_impl.h
         src/monerod_module_impl.cpp
+        src/monerod_settings.h
+        src/monerod_settings.cpp
         src/loopback_http.h
         src/loopback_http.cpp
     EXTERNAL_LIBS

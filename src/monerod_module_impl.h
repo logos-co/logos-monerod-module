@@ -13,6 +13,8 @@
 #include <logos_module_context.h>
 #include <logos_result.h>
 
+namespace logos { class LpClient; }
+
 /// A Monero node running in-process through libmonerod_c. One node at a time; its
 /// lifetime is this module's lifetime.
 class MonerodModuleImpl : public LogosModuleContext {
@@ -23,13 +25,15 @@ public:
     /// Merge `config` into the stored settings for `network` (mainnet|stagenet|testnet).
     StdLogosResult configure(const std::string& network, const LogosMap& config);
 
-    /// Stored settings for `network`, with defaults filled in.
+    /// Stored settings for `network`, with defaults filled in. `txProxy` (bool): send this
+    /// node's own transactions only over Tor; true by default on mainnet, refused elsewhere.
     LogosMap getConfig(const std::string& network);
 
     /// Default settings for `network`.
     LogosMap defaultConfig(const std::string& network);
 
-    /// Start the node for `network`. Returns once its thread is running.
+    /// Start the node for `network`. Returns once its thread is running. With `txProxy` on,
+    /// asks tor_module for its SOCKS port first, and starts without Tor if there is none.
     StdLogosResult start(const std::string& network);
 
     /// Stop the node and wait for it to shut down.
@@ -40,12 +44,17 @@ public:
     ///   "rpcUrl": string, "uptimeSecs": number, "dataDir": string, "version": string,
     ///   "lastError": string, "height": number, "targetHeight": number,
     ///   "synchronized": bool, "peersOut": number, "peersIn": number,
-    ///   "databaseSize": string, "chainAgeSecs": number, "tipAgeSecs": number }
+    ///   "databaseSize": string, "chainAgeSecs": number, "tipAgeSecs": number,
+    ///   "txProxy": "on|off|unavailable", "txProxyReason": string, "txProxySocks": string,
+    ///   "txProxyRestart": bool }
     /// @endcode
     /// Never waits on the node: the chain fields come from its last get_info answer,
     /// `chainAgeSecs` old (-1 before the first). `tipAgeSecs` is how far the top block's
     /// own timestamp lags the clock (-1 until one is known): `synchronized` stays true
     /// with no peers, so it is the only field separating a stalled chain from a current one.
+    /// `txProxy` is what the running node was started with ("off" while stopped);
+    /// `txProxyReason` says why it is unavailable, or that Tor's port has changed since, and
+    /// `txProxyRestart` is true when a restart would put Tor's current port in effect.
     LogosMap status();
 
     /// Loopback RPC URL the node serves for `network`.
@@ -69,6 +78,8 @@ private:
     void unloadLog(const std::string& line);
     void pollChain();
     void resetChain();
+    nlohmann::json askTor(std::string& why);
+    void pollTor();
 
     std::mutex m_mutex;
     std::thread m_stopThread;
@@ -87,4 +98,15 @@ private:
     uint64_t m_chainGen = 0;                           // guarded; bumped when the node starts or stops
     uint64_t m_tipTime = 0;                            // guarded; unix seconds of m_tipHash, 0 = unknown
     std::string m_tipHash;                             // guarded; the block m_tipTime came from
+
+    // What the running node was started with (guarded by m_chainMutex)...
+    bool m_txWanted = false;
+    std::string m_txMode = "off";                      // on|off|unavailable
+    std::string m_txReason, m_txSocks;
+    // ...and tor_module's SOCKS port as the poll thread last saw it (also guarded).
+    bool m_torPolled = false;
+    std::string m_torSocks, m_torWhy;
+    std::chrono::steady_clock::time_point m_torAskedAt;
+    std::mutex m_torMutex;
+    logos::LpClient* m_tor = nullptr;                  // guarded by m_torMutex
 };

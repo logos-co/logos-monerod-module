@@ -6,22 +6,20 @@
 #include <filesystem>
 #include <fstream>
 
+#include "logos_sdk.h"
 #include "loopback_http.h"
 #include "monerod_c.h"
+#include "monerod_settings.h"
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
 namespace {
 
-struct NetPorts { int rpc, p2p; };
-
-bool portsFor(const std::string& network, NetPorts& out) {
-    if (network == "mainnet")  { out = {18081, 18080}; return true; }
-    if (network == "testnet")  { out = {28081, 28080}; return true; }
-    if (network == "stagenet") { out = {38081, 38080}; return true; }
-    return false;
-}
+// tor_module's status() answers at once; this bounds an absent or stuck one.
+constexpr int kTorBudgetMs = 1000;
+// While the node runs with txProxy wanted, how often the poll thread re-reads Tor's port.
+constexpr auto kTorPollEvery = std::chrono::seconds(30);
 
 std::string takeString(const char* s) {
     std::string out = s ? s : "";
@@ -79,6 +77,7 @@ void MonerodModuleImpl::pollChain() {
                 }
             }
         }
+        if (!url.empty()) pollTor();
         lock.lock();
         if (gen == m_chainGen && !chain.is_null()) {
             m_chain = std::move(chain);
@@ -97,6 +96,52 @@ void MonerodModuleImpl::resetChain() {
     m_tipTime = 0;
     m_tipHash.clear();
     ++m_chainGen;
+}
+
+// Async, then waited for: a blocking call from a worker nests in the main thread's event loop.
+json MonerodModuleImpl::askTor(std::string& why) {
+    logos::LpClient* tor = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_torMutex);
+        if (!m_tor) m_tor = &modules().dynamic("tor_module");  // dynamic() is not thread-safe
+        tor = m_tor;
+    }
+    struct Reply { std::mutex m; std::condition_variable cv; bool done = false; json value; std::string err; };
+    auto r = std::make_shared<Reply>();
+    tor->invokeAsyncResult("status", json::array(), [r](json v, const logos::CallError& e) {
+        std::lock_guard<std::mutex> lock(r->m);
+        if (!e.ok())
+            r->err = e.code == "object_unavailable" ? "tor_module is not loaded"
+                                                    : "tor_module: " + (e.message.empty() ? e.code : e.message);
+        r->value = std::move(v);
+        r->done = true;
+        r->cv.notify_all();
+    }, kTorBudgetMs);
+    std::unique_lock<std::mutex> lock(r->m);
+    if (!r->cv.wait_for(lock, std::chrono::milliseconds(kTorBudgetMs + 200), [&] { return r->done; })) {
+        why = "tor_module did not answer";
+        return nullptr;
+    }
+    why = r->err;
+    return why.empty() ? r->value : json();
+}
+
+// Every kTorPollEvery while the node runs with txProxy wanted, so status() can say when
+// Tor's port has moved since the start. Asking also keeps the node listed in the Tor app.
+void MonerodModuleImpl::pollTor() {
+    {
+        std::lock_guard<std::mutex> lock(m_chainMutex);
+        if (!m_txWanted || (m_torPolled && std::chrono::steady_clock::now() - m_torAskedAt < kTorPollEvery))
+            return;
+        m_torAskedAt = std::chrono::steady_clock::now();
+    }
+    std::string why;
+    const json reply = askTor(why);
+    const std::string socks = why.empty() ? monerod::torSocks(reply, why) : "";
+    std::lock_guard<std::mutex> lock(m_chainMutex);
+    m_torPolled = true;
+    m_torSocks = socks;
+    m_torWhy = why;
 }
 
 void MonerodModuleImpl::onContextReady() {
@@ -137,30 +182,12 @@ void MonerodModuleImpl::unloadLog(const std::string& line) {
 }
 
 LogosMap MonerodModuleImpl::defaultConfig(const std::string& network) {
-    NetPorts p{};
-    if (!portsFor(network, p)) return json::object();
-    return json{
-        {"dataDir", m_persistDir.empty() ? "" : (fs::path(m_persistDir) / "chain").string()},
-        {"rpcBindPort", p.rpc},
-        {"p2pBindPort", p.p2p},
-        {"pruneBlockchain", network == "mainnet"},  // ~60 GB instead of ~250 GB
-        {"outPeers", -1},
-        {"inPeers", -1},
-        {"limitRateUp", -1},
-        {"limitRateDown", -1},
-        {"noIgd", true},
-        {"offline", false},
-        {"logLevel", 0},
-        {"proxy", ""},
-    };
+    return monerod::defaultSettings(network, m_persistDir);
 }
 
 json MonerodModuleImpl::settingsFor(const std::string& network) {
-    json s = defaultConfig(network);
-    if (m_config.contains(network) && m_config[network].is_object())
-        for (auto& [k, v] : m_config[network].items())
-            if (s.contains(k)) s[k] = v;
-    return s;
+    return monerod::effectiveSettings(network, m_persistDir,
+                                      m_config.contains(network) ? m_config[network] : json());
 }
 
 LogosMap MonerodModuleImpl::getConfig(const std::string& network) {
@@ -169,22 +196,17 @@ LogosMap MonerodModuleImpl::getConfig(const std::string& network) {
 }
 
 StdLogosResult MonerodModuleImpl::configure(const std::string& network, const LogosMap& config) {
-    NetPorts p{};
-    if (!portsFor(network, p)) return fail("unknown network: " + network);
+    if (!monerod::knownNetwork(network)) return fail("unknown network: " + network);
     if (!config.is_object()) return fail("config must be an object");
     std::lock_guard<std::mutex> lock(m_mutex);
     const json defaults = defaultConfig(network);
+    for (auto& [k, v] : config.items()) {
+        const std::string why = monerod::checkSetting(network, k, v, defaults);
+        if (!why.empty()) return fail(why);
+    }
     json& stored = m_config[network];
     if (!stored.is_object()) stored = json::object();
-    for (auto& [k, v] : config.items()) {
-        if (!defaults.contains(k)) return fail("unknown setting: " + k);
-        const json& d = defaults[k];
-        // nlohmann types a parsed 8 as unsigned and the default -1 as signed.
-        const bool ok = d.is_number() ? v.is_number_integer()
-                      : d.is_boolean() ? v.is_boolean() : v.is_string();
-        if (!ok) return fail("wrong type for " + k);
-        stored[k] = v;
-    }
+    for (auto& [k, v] : config.items()) stored[k] = v;
     persist();
     return {true, settingsFor(network)};
 }
@@ -199,40 +221,43 @@ void MonerodModuleImpl::persist() {
 }
 
 StdLogosResult MonerodModuleImpl::start(const std::string& network) {
-    NetPorts p{};
-    if (!portsFor(network, p)) return fail("unknown network: " + network);
-    json argv = json::array();
+    if (!monerod::knownNetwork(network)) return fail("unknown network: " + network);
+    // Before asking Tor: a refused start must not start Tor nor touch the running node's state.
+    const int state = MONEROD_state();
+    if (state == MONEROD_STARTING || state == MONEROD_RUNNING || state == MONEROD_STOPPING)
+        return fail("a daemon is already running in this process");
+    json s;
+    std::string logFile;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_persistDir.empty()) return fail("no persistence path yet");
-        const json s = settingsFor(network);
-        if (network != "mainnet") argv.push_back("--" + network);
-        m_logFile = (fs::path(m_persistDir) / ("monerod-" + network + ".log")).string();
-        argv.push_back("--data-dir=" + s["dataDir"].get<std::string>());
-        argv.push_back("--log-file=" + m_logFile);
-        argv.push_back("--log-level=" + std::to_string(s["logLevel"].get<int>()));
-        argv.push_back("--rpc-bind-ip=127.0.0.1");
-        argv.push_back("--rpc-bind-port=" + std::to_string(s["rpcBindPort"].get<int>()));
-        argv.push_back("--p2p-bind-port=" + std::to_string(s["p2pBindPort"].get<int>()));
-        argv.push_back("--no-zmq");
-        argv.push_back("--check-updates=disabled");
-        if (s["pruneBlockchain"].get<bool>()) argv.push_back("--prune-blockchain");
-        if (s["noIgd"].get<bool>()) argv.push_back("--no-igd");
-        if (s["offline"].get<bool>()) argv.push_back("--offline");
-        for (const char* k : {"outPeers", "inPeers", "limitRateUp", "limitRateDown"}) {
-            const int v = s[k].get<int>();
-            if (v < 0) continue;
-            static const json flag = {{"outPeers", "--out-peers="}, {"inPeers", "--in-peers="},
-                                      {"limitRateUp", "--limit-rate-up="},
-                                      {"limitRateDown", "--limit-rate-down="}};
-            argv.push_back(flag[k].get<std::string>() + std::to_string(v));
-        }
-        if (!s["proxy"].get<std::string>().empty())
-            argv.push_back("--proxy=" + s["proxy"].get<std::string>());
+        s = settingsFor(network);
+        logFile = (fs::path(m_persistDir) / ("monerod-" + network + ".log")).string();
     }
+    // Outside m_mutex: no lock is held across IPC.
+    const bool wanted = s["txProxy"].get<bool>();
+    std::string socks, why;
+    if (wanted) {
+        const json reply = askTor(why);
+        if (why.empty()) socks = monerod::torSocks(reply, why);
+    }
+    const json argv = monerod::buildArgv(network, s, logFile, socks);
+    { std::lock_guard<std::mutex> lock(m_mutex); m_logFile = logFile; }
     resetChain();
     if (MONEROD_start(argv.dump().c_str()) != 0)
         return fail(takeString(MONEROD_last_error()));
+    {
+        std::lock_guard<std::mutex> lock(m_chainMutex);
+        m_txWanted = wanted;
+        m_txMode = !wanted ? "off" : socks.empty() ? "unavailable" : "on";
+        m_txReason = wanted && socks.empty() ? why : "";
+        m_txSocks = socks;
+        // The answer start() just got is the poll thread's first one.
+        m_torPolled = wanted;
+        m_torSocks = socks;
+        m_torWhy = why;
+        m_torAskedAt = std::chrono::steady_clock::now();
+    }
     emitState();
     return {true, status()};
 }
@@ -240,13 +265,20 @@ StdLogosResult MonerodModuleImpl::start(const std::string& network) {
 StdLogosResult MonerodModuleImpl::stop() {
     MONEROD_stop();
     resetChain();
+    {
+        std::lock_guard<std::mutex> lock(m_chainMutex);
+        m_txWanted = false;
+        m_txMode = "off";
+        m_txReason.clear();
+        m_txSocks.clear();
+        m_torPolled = false;
+    }
     emitState();
     return {true, status()};
 }
 
 std::string MonerodModuleImpl::rpcEndpoint(const std::string& network) {
-    NetPorts p{};
-    if (!portsFor(network, p)) return "";
+    if (!monerod::knownNetwork(network)) return "";
     std::lock_guard<std::mutex> lock(m_mutex);
     return "http://127.0.0.1:" + std::to_string(settingsFor(network)["rpcBindPort"].get<int>());
 }
@@ -258,10 +290,26 @@ LogosMap MonerodModuleImpl::status() {
     st["height"] = 0; st["targetHeight"] = 0; st["synchronized"] = false;
     st["peersOut"] = 0; st["peersIn"] = 0; st["databaseSize"] = "0"; st["chainAgeSecs"] = -1;
     st["tipAgeSecs"] = -1;
-    if (st.value("state", "") != "running") return st;
+    const std::string state = st.value("state", "");
 
     std::lock_guard<std::mutex> lock(m_chainMutex);
-    if (!m_chain.is_object()) return st;
+    const bool live = state == "starting" || state == "running" || state == "stopping";
+    st["txProxy"] = live ? m_txMode : "off";
+    st["txProxySocks"] = live ? m_txSocks : "";
+    st["txProxyReason"] = live ? m_txReason : "";
+    st["txProxyRestart"] = false;
+    // monerod takes the address once, at start: a later change needs a restart.
+    if (live && m_torPolled && m_txMode != "off" && m_torSocks != m_txSocks) {
+        if (m_torSocks.empty()) {
+            st["txProxyReason"] = "Tor's SOCKS port has been unavailable since the start (" + m_torWhy
+                                  + "): transactions wait until it is back";
+        } else {
+            st["txProxyRestart"] = true;
+            st["txProxyReason"] = (m_txMode == "on" ? "Tor's SOCKS port moved to " : "Tor's SOCKS port is up at ")
+                                  + m_torSocks + ": restart the node to use it";
+        }
+    }
+    if (state != "running" || !m_chain.is_object()) return st;
     const json& info = m_chain;
     st["chainAgeSecs"] = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - m_chainAt).count();

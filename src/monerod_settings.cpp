@@ -96,8 +96,12 @@ json effectiveSettings(const std::string& network, const std::string& persistDir
     return s;
 }
 
+std::string txProxySocks(const std::string& torSocks) {
+    return torSocks.empty() ? kTorDefaultSocks : torSocks;
+}
+
 json buildArgv(const std::string& network, const json& s, const std::string& logFile,
-               const std::string& txProxySocks) {
+               const std::string& torSocks) {
     json argv = json::array();
     if (network != "mainnet") argv.push_back("--" + network);
     argv.push_back("--data-dir=" + s["dataDir"].get<std::string>());
@@ -120,9 +124,10 @@ json buildArgv(const std::string& network, const json& s, const std::string& log
     }
     if (!s["proxy"].get<std::string>().empty())
         argv.push_back("--proxy=" + s["proxy"].get<std::string>());
-    // No scheme is SOCKS4a, which tor_module serves; monerod rejects "socks5h://".
-    if (!txProxySocks.empty())
-        argv.push_back("--tx-proxy=tor," + txProxySocks + "," + std::to_string(kTxProxyMaxPeers));
+    // Even with Tor down: monerod then holds the node's own transactions instead of sending them
+    // in the clear. No scheme is SOCKS4a, which tor_module serves; monerod rejects "socks5h://".
+    if (s.value("txProxy", false))
+        argv.push_back("--tx-proxy=tor," + txProxySocks(torSocks) + "," + std::to_string(kTxProxyMaxPeers));
     return argv;
 }
 
@@ -143,6 +148,36 @@ std::string torSocks(const json& reply, std::string& why) {
     if (!ipPort(s)) { why = "unexpected SOCKS address from tor_module: " + st["socks"].dump(); return ""; }
     why.clear();
     return s;
+}
+
+int torPeers(const json& connections, uint64_t height) {
+    if (!connections.is_array()) return -1;
+    int n = 0;
+    for (const auto& c : connections) {
+        if (!c.is_object()) return -1;
+        // address_type 4 = tor (epee net/enums.h); levin_notify.cpp sends through outbound ones only.
+        if (c.value("address_type", 0) == 4 && !c.value("incoming", true)
+            && c.value("height", uint64_t{0}) + 2 >= height)
+            ++n;
+    }
+    return n;
+}
+
+TxProxyState txProxyState(const std::string& inUse, const std::string& torSocks,
+                          const std::string& torWhy, int peers) {
+    TxProxyState t;
+    // monerod takes the address once, at start: a port Tor moved to needs a restart.
+    if (!torSocks.empty() && torSocks != inUse) {
+        t.waiting = t.restart = true;
+        t.reason = "Tor moved to " + torSocks + ". Restart the node to use it; until then payments wait in the node.";
+    } else if (torSocks.empty() && peers <= 0) {
+        t.waiting = true;
+        t.reason = "Tor is not available: " + torWhy + ". Payments wait in the node until it is and a Tor peer connects.";
+    } else if (peers == 0) {
+        t.waiting = true;
+        t.reason = "No Tor peer yet. Payments wait in the node until one connects.";
+    }
+    return t;
 }
 
 }  // namespace monerod

@@ -51,8 +51,10 @@ void MonerodModuleImpl::pollChain() {
     while (!m_chainStop) {
         const uint64_t gen = m_chainGen;
         const std::string knownTip = m_tipHash;
+        const bool txOn = m_txOn;
         lock.unlock();
         json chain;
+        int torPeers = -1;
         std::string tipHash;
         uint64_t tipTime = 0;
         const json st = json::parse(takeString(MONEROD_status_json()), nullptr, false);
@@ -76,10 +78,21 @@ void MonerodModuleImpl::pollChain() {
                     tipTime = hdr.value("timestamp", uint64_t{0});
                 }
             }
+            if (txOn && chain.is_object()) {
+                const json c = json::parse(loopbackPost(port, "/json_rpc",
+                    R"({"jsonrpc":"2.0","id":"0","method":"get_connections"})", 30000, &m_chainStop),
+                    nullptr, false);
+                // epee leaves an empty list out.
+                if (c.is_object() && c.contains("result") && c["result"].is_object()
+                    && c["result"].value("status", "") == "OK")
+                    torPeers = monerod::torPeers(c["result"].value("connections", json::array()),
+                                                 chain.value("height", uint64_t{0}));
+            }
         }
         if (!url.empty()) pollTor();
         lock.lock();
         if (gen == m_chainGen && !chain.is_null()) {
+            m_torPeers = torPeers;
             m_chain = std::move(chain);
             m_chainAt = std::chrono::steady_clock::now();
             // Both read off one header, so the pair holds even if a block landed mid-poll.
@@ -95,6 +108,7 @@ void MonerodModuleImpl::resetChain() {
     m_chain = nullptr;
     m_tipTime = 0;
     m_tipHash.clear();
+    m_torPeers = -1;
     ++m_chainGen;
 }
 
@@ -126,20 +140,18 @@ json MonerodModuleImpl::askTor(std::string& why) {
     return why.empty() ? r->value : json();
 }
 
-// Every kTorPollEvery while the node runs with txProxy wanted, so status() can say when
-// Tor's port has moved since the start. Asking also keeps the node listed in the Tor app.
+// Every kTorPollEvery while the node runs with --tx-proxy, so status() can say whether Tor is
+// up and on the port in use. Asking also keeps the node listed in the Tor app.
 void MonerodModuleImpl::pollTor() {
     {
         std::lock_guard<std::mutex> lock(m_chainMutex);
-        if (!m_txWanted || (m_torPolled && std::chrono::steady_clock::now() - m_torAskedAt < kTorPollEvery))
-            return;
+        if (!m_txOn || std::chrono::steady_clock::now() - m_torAskedAt < kTorPollEvery) return;
         m_torAskedAt = std::chrono::steady_clock::now();
     }
     std::string why;
     const json reply = askTor(why);
     const std::string socks = why.empty() ? monerod::torSocks(reply, why) : "";
     std::lock_guard<std::mutex> lock(m_chainMutex);
-    m_torPolled = true;
     m_torSocks = socks;
     m_torWhy = why;
 }
@@ -234,10 +246,10 @@ StdLogosResult MonerodModuleImpl::start(const std::string& network) {
         s = settingsFor(network);
         logFile = (fs::path(m_persistDir) / ("monerod-" + network + ".log")).string();
     }
-    // Outside m_mutex: no lock is held across IPC.
-    const bool wanted = s["txProxy"].get<bool>();
+    // Outside m_mutex: no lock is held across IPC. Tor's answer only picks the port.
+    const bool txOn = s["txProxy"].get<bool>();
     std::string socks, why;
-    if (wanted) {
+    if (txOn) {
         const json reply = askTor(why);
         if (why.empty()) socks = monerod::torSocks(reply, why);
     }
@@ -248,12 +260,9 @@ StdLogosResult MonerodModuleImpl::start(const std::string& network) {
         return fail(takeString(MONEROD_last_error()));
     {
         std::lock_guard<std::mutex> lock(m_chainMutex);
-        m_txWanted = wanted;
-        m_txMode = !wanted ? "off" : socks.empty() ? "unavailable" : "on";
-        m_txReason = wanted && socks.empty() ? why : "";
-        m_txSocks = socks;
+        m_txOn = txOn;
+        m_txSocks = txOn ? monerod::txProxySocks(socks) : "";
         // The answer start() just got is the poll thread's first one.
-        m_torPolled = wanted;
         m_torSocks = socks;
         m_torWhy = why;
         m_torAskedAt = std::chrono::steady_clock::now();
@@ -267,11 +276,8 @@ StdLogosResult MonerodModuleImpl::stop() {
     resetChain();
     {
         std::lock_guard<std::mutex> lock(m_chainMutex);
-        m_txWanted = false;
-        m_txMode = "off";
-        m_txReason.clear();
+        m_txOn = false;
         m_txSocks.clear();
-        m_torPolled = false;
     }
     emitState();
     return {true, status()};
@@ -293,22 +299,15 @@ LogosMap MonerodModuleImpl::status() {
     const std::string state = st.value("state", "");
 
     std::lock_guard<std::mutex> lock(m_chainMutex);
-    const bool live = state == "starting" || state == "running" || state == "stopping";
-    st["txProxy"] = live ? m_txMode : "off";
-    st["txProxySocks"] = live ? m_txSocks : "";
-    st["txProxyReason"] = live ? m_txReason : "";
-    st["txProxyRestart"] = false;
-    // monerod takes the address once, at start: a later change needs a restart.
-    if (live && m_torPolled && m_txMode != "off" && m_torSocks != m_txSocks) {
-        if (m_torSocks.empty()) {
-            st["txProxyReason"] = "Tor's SOCKS port has been unavailable since the start (" + m_torWhy
-                                  + "): transactions wait until it is back";
-        } else {
-            st["txProxyRestart"] = true;
-            st["txProxyReason"] = (m_txMode == "on" ? "Tor's SOCKS port moved to " : "Tor's SOCKS port is up at ")
-                                  + m_torSocks + ": restart the node to use it";
-        }
-    }
+    const bool on = m_txOn && (state == "starting" || state == "running" || state == "stopping");
+    const monerod::TxProxyState tx = on ? monerod::txProxyState(m_txSocks, m_torSocks, m_torWhy, m_torPeers)
+                                        : monerod::TxProxyState{};
+    st["txProxy"] = on ? "on" : "off";
+    st["txProxySocks"] = on ? m_txSocks : "";
+    st["txProxyPeers"] = on ? m_torPeers : -1;
+    st["txProxyWaiting"] = tx.waiting;
+    st["txProxyReason"] = tx.reason;
+    st["txProxyRestart"] = tx.restart;
     if (state != "running" || !m_chain.is_object()) return st;
     const json& info = m_chain;
     st["chainAgeSecs"] = std::chrono::duration_cast<std::chrono::seconds>(

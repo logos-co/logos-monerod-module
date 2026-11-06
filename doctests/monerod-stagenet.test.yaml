@@ -62,9 +62,9 @@ sections:
 
   - title: "Transactions over Tor"
     steps:
-      - title: "txProxy is on for mainnet, refused elsewhere, and unavailable without tor_module"
+      - title: "txProxy is on for mainnet, refused elsewhere, and on even without tor_module"
         # Offline and on spare ports, so nothing leaves the runner. tor_module is not staged: the
-        # node must start without --tx-proxy and say why rather than refuse to start.
+        # node must still start with --tx-proxy, at tor_module's default port, and say payments wait.
         run: |
           set -eu
           export LOGOSCTL_CONFIG_DIR="$PWD/session-tx"
@@ -82,5 +82,7 @@ sections:
         expect_contains:
           - '"txProxy":true'
           - 'txProxy is mainnet-only: monerod knows no Tor peers on stagenet'
-          - '"txProxy":"unavailable"'
-          - '"txProxyReason":"tor_module is not loaded"'
+          - '"txProxy":"on"'
+          - '"txProxySocks":"127.0.0.1:9250"'
+          - '"txProxyWaiting":true'
+          - '"txProxyReason":"Tor is not available: tor_module is not loaded. Payments wait in the node until it is and a Tor peer connects."'

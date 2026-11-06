@@ -1,4 +1,4 @@
-// Settings, argv and tor_module's reply: what start() hands to monerod.
+// Settings, argv, tor_module's reply and the txProxy status: what start() and status() compute.
 
 #include <logos_test.h>
 
@@ -52,14 +52,35 @@ LOGOS_TEST(stored_values_configure_would_refuse_are_ignored) {
     LOGOS_ASSERT_TRUE(monerod::effectiveSettings("mainnet", "/p", nullptr)["txProxy"].get<bool>());
 }
 
-LOGOS_TEST(argv_adds_tx_proxy_only_with_an_address) {
+LOGOS_TEST(argv_always_carries_tx_proxy_when_on) {
     const json s = monerod::defaultSettings("mainnet", "/p");
-    const json with = monerod::buildArgv("mainnet", s, "/p/l.log", "127.0.0.1:9250");
-    LOGOS_ASSERT_TRUE(hasArg(with, "--tx-proxy=tor,127.0.0.1:9250,10"));
-    LOGOS_ASSERT_EQ(countPrefix(with, "--tx-proxy"), 1);
-    LOGOS_ASSERT_EQ(countPrefix(with, "--proxy"), 0);
-    const json without = monerod::buildArgv("mainnet", s, "/p/l.log", "");
-    LOGOS_ASSERT_EQ(countPrefix(without, "--tx-proxy"), 0);
+    const json atTor = monerod::buildArgv("mainnet", s, "/p/l.log", "127.0.0.1:41234");
+    LOGOS_ASSERT_TRUE(hasArg(atTor, "--tx-proxy=tor,127.0.0.1:41234,10"));
+    LOGOS_ASSERT_EQ(countPrefix(atTor, "--tx-proxy"), 1);
+    LOGOS_ASSERT_EQ(countPrefix(atTor, "--proxy"), 0);
+    // No port from tor_module: still --tx-proxy, at its default port.
+    const json noTor = monerod::buildArgv("mainnet", s, "/p/l.log", "");
+    LOGOS_ASSERT_TRUE(hasArg(noTor, "--tx-proxy=tor,127.0.0.1:9250,10"));
+    LOGOS_ASSERT_EQ(countPrefix(noTor, "--tx-proxy"), 1);
+    json off = s;
+    off["txProxy"] = false;
+    LOGOS_ASSERT_EQ(countPrefix(monerod::buildArgv("mainnet", off, "/p/l.log", "127.0.0.1:41234"), "--tx-proxy"), 0);
+}
+
+// start(): tor_module's reply, or none, picks the port; it never drops the flag.
+LOGOS_TEST(argv_from_any_tor_answer_carries_tx_proxy) {
+    const json s = monerod::defaultSettings("mainnet", "/p");
+    const json replies[] = {json{{"ok", true}, {"socks", "socks5h://127.0.0.1:41234"}},
+                            json{{"ok", true}, {"socks", nullptr}}, json{{"ok", true}, {"state", "ready"}},
+                            json{{"ok", false}, {"error", "boom"}}, json("not json"), json()};
+    for (const json& reply : replies) {
+        std::string why;
+        const std::string socks = monerod::torSocks(reply, why);
+        const json argv = monerod::buildArgv("mainnet", s, "/p/l.log", socks);
+        LOGOS_ASSERT_EQ(countPrefix(argv, "--tx-proxy=tor,"), 1);
+        LOGOS_ASSERT_TRUE(hasArg(argv, socks.empty() ? "--tx-proxy=tor,127.0.0.1:9250,10"
+                                                     : "--tx-proxy=tor,127.0.0.1:41234,10"));
+    }
 }
 
 LOGOS_TEST(argv_keeps_proxy_and_tx_proxy_apart) {
@@ -106,5 +127,49 @@ LOGOS_TEST(tor_socks_says_why_there_is_none) {
                             "socks5h://127.0.0.1:0", "socks5h://127.0.0.1:70000", "socks5h://1.2.3:9250"}) {
         LOGOS_ASSERT_EQ(monerod::torSocks({{"ok", true}, {"socks", bad}}, why), std::string());
         LOGOS_ASSERT_CONTAINS(why, "unexpected SOCKS address");
+    }
+}
+
+LOGOS_TEST(tor_peers_counts_outbound_tor_near_the_tip) {
+    const json conns = json::parse(R"([
+        {"address_type": 4, "incoming": false, "height": 3800662, "state": "normal"},
+        {"address_type": 4, "incoming": false, "height": 3800660, "state": "normal"},
+        {"address_type": 4, "incoming": false, "height": 3800659, "state": "normal"},
+        {"address_type": 4, "incoming": false, "height": 0, "state": "before_handshake"},
+        {"address_type": 4, "incoming": true, "height": 3800662, "state": "normal"},
+        {"address_type": 1, "incoming": false, "height": 3800662, "state": "normal"}
+    ])");
+    LOGOS_ASSERT_EQ(monerod::torPeers(conns, 3800662), 2);
+    LOGOS_ASSERT_EQ(monerod::torPeers(json::array(), 3800662), 0);
+    LOGOS_ASSERT_EQ(monerod::torPeers(json(), 3800662), -1);
+    LOGOS_ASSERT_EQ(monerod::torPeers(json::array({1}), 3800662), -1);
+}
+
+LOGOS_TEST(tx_proxy_state_waits_and_says_why) {
+    const std::string at = "127.0.0.1:9250";
+    auto st = monerod::txProxyState(at, at, "", 2);
+    LOGOS_ASSERT_FALSE(st.waiting);
+    LOGOS_ASSERT_EQ(st.reason, std::string());
+    st = monerod::txProxyState(at, at, "", -1);          // not counted yet
+    LOGOS_ASSERT_FALSE(st.waiting);
+    st = monerod::txProxyState(at, at, "", 0);
+    LOGOS_ASSERT_TRUE(st.waiting);
+    LOGOS_ASSERT_FALSE(st.restart);
+    LOGOS_ASSERT_EQ(st.reason, std::string("No Tor peer yet. Payments wait in the node until one connects."));
+    for (int peers : {0, -1}) {
+        st = monerod::txProxyState(at, "", "tor_module is not loaded", peers);
+        LOGOS_ASSERT_TRUE(st.waiting);
+        LOGOS_ASSERT_EQ(st.reason, std::string("Tor is not available: tor_module is not loaded. "
+                                               "Payments wait in the node until it is and a Tor peer connects."));
+    }
+    // Something else serves the port and the node has Tor peers through it.
+    st = monerod::txProxyState(at, "", "tor_module is not loaded", 3);
+    LOGOS_ASSERT_FALSE(st.waiting);
+    for (int peers : {-1, 0, 2}) {
+        st = monerod::txProxyState(at, "127.0.0.1:41234", "", peers);
+        LOGOS_ASSERT_TRUE(st.waiting);
+        LOGOS_ASSERT_TRUE(st.restart);
+        LOGOS_ASSERT_EQ(st.reason, std::string("Tor moved to 127.0.0.1:41234. Restart the node to use it; "
+                                               "until then payments wait in the node."));
     }
 }

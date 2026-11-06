@@ -32,8 +32,8 @@ public:
     /// Default settings for `network`.
     LogosMap defaultConfig(const std::string& network);
 
-    /// Start the node for `network`. Returns once its thread is running. With `txProxy` on,
-    /// asks tor_module for its SOCKS port first, and starts without Tor if there is none.
+    /// Start the node for `network`. Returns once its thread is running. With `txProxy` on it
+    /// always starts with --tx-proxy: at tor_module's SOCKS port, or its default 127.0.0.1:9250.
     StdLogosResult start(const std::string& network);
 
     /// Stop the node and wait for it to shut down.
@@ -45,16 +45,16 @@ public:
     ///   "lastError": string, "height": number, "targetHeight": number,
     ///   "synchronized": bool, "peersOut": number, "peersIn": number,
     ///   "databaseSize": string, "chainAgeSecs": number, "tipAgeSecs": number,
-    ///   "txProxy": "on|off|unavailable", "txProxyReason": string, "txProxySocks": string,
-    ///   "txProxyRestart": bool }
+    ///   "txProxy": "on|off", "txProxySocks": string, "txProxyPeers": number,
+    ///   "txProxyWaiting": bool, "txProxyReason": string, "txProxyRestart": bool }
     /// @endcode
     /// Never waits on the node: the chain fields come from its last get_info answer,
     /// `chainAgeSecs` old (-1 before the first). `tipAgeSecs` is how far the top block's
     /// own timestamp lags the clock (-1 until one is known): `synchronized` stays true
     /// with no peers, so it is the only field separating a stalled chain from a current one.
-    /// `txProxy` is what the running node was started with ("off" while stopped);
-    /// `txProxyReason` says why it is unavailable, or that Tor's port has changed since, and
-    /// `txProxyRestart` is true when a restart would put Tor's current port in effect.
+    /// `txProxy` is "on" when the running node was started with --tx-proxy ("off" while stopped);
+    /// `txProxyPeers`, its outbound Tor connections (-1 unknown); `txProxyWaiting`, true while its
+    /// payments cannot leave, `txProxyReason` saying why; `txProxyRestart`, Tor has moved port.
     LogosMap status();
 
     /// Loopback RPC URL the node serves for `network`.
@@ -100,13 +100,12 @@ private:
     std::string m_tipHash;                             // guarded; the block m_tipTime came from
 
     // What the running node was started with (guarded by m_chainMutex)...
-    bool m_txWanted = false;
-    std::string m_txMode = "off";                      // on|off|unavailable
-    std::string m_txReason, m_txSocks;
-    // ...and tor_module's SOCKS port as the poll thread last saw it (also guarded).
-    bool m_torPolled = false;
+    bool m_txOn = false;
+    std::string m_txSocks;
+    // ...tor_module's SOCKS port as last asked, and the node's Tor peers (also guarded).
     std::string m_torSocks, m_torWhy;
     std::chrono::steady_clock::time_point m_torAskedAt;
+    int m_torPeers = -1;
     std::mutex m_torMutex;
     logos::LpClient* m_tor = nullptr;                  // guarded by m_torMutex
 };

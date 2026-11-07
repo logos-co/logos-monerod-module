@@ -39,6 +39,10 @@ jobs:
         # its dependants compile against; both rest on one expensive derivation.
         run: nix build -L .#lgx .#default
 
+      - name: Unit tests
+        # Settings, argv and tor_module's reply; monerod_c is mocked out, so this builds no node.
+        run: nix build -L .#unit-tests
+
       - name: The library and its licenses ship beside the plugin
         run: |
           set -euo pipefail

@@ -78,13 +78,14 @@ are the Monero tree logos-monero-nix pins (v0.18.5.4, `85f036b`).
   it (`src/rpc/core_rpc_server.cpp:1394-1396`, whose TODO says so). The payment is in the
   node's pool, so a wallet shows it as pending; `txProxyWaiting` and `txProxyReason` say why
   it has not left.
-- **When Tor comes back.** The node keeps dialling Tor and needs no restart. With no Tor peer
-  on its list it retries Tor's seed nodes every round (`net_node.inl:1926, 1865-1875`). With
-  Tor peers on its list, it skips any address that failed in the past hour
-  (`net_node.inl:1557, 1816`; `cryptonote_config.h:155`), so its first Tor peer can take up
-  to about an hour; a restart clears that memory (`net_node.h:489`). Once a Tor peer is
-  connected, a waiting payment leaves at the pool's next retry. Measured on mainnet: the
-  first Tor peer came 400 s after tor_module loaded on a fresh node, and 171 s after on a
+- **When Tor comes back** on the same port, the node keeps dialling it and needs no restart
+  (on another port, see "Following Tor's port" below). With no Tor peer on its list it
+  retries Tor's seed nodes every round (`net_node.inl:1926, 1865-1875`). With Tor peers on its
+  list, it skips any address that failed in the past hour (`net_node.inl:1557, 1816`;
+  `cryptonote_config.h:155`), so its first Tor peer can take up to about an hour; a restart,
+  such as the Monero Node app's Restart, clears that memory (`net_node.h:489`). Once a Tor
+  peer is connected, a waiting payment leaves at the pool's next retry. Measured on mainnet:
+  the first Tor peer came 400 s after tor_module loaded on a fresh node, and 171 s after on a
   node restarted with Tor peers on its list and Tor down for its first 90 s.
 - **Clearnet can stall while Tor comes up.** One loop opens outbound connections for every
   zone (`net_node.inl:1913-1960`), and a Tor dial holds it for up to 45 s waiting on the
@@ -111,12 +112,24 @@ are the Monero tree logos-monero-nix pins (v0.18.5.4, `85f036b`).
   (`net_node.inl:921-931`). `txProxy` adds separate Tor connections for this node's own
   transactions. Either, both or neither may be on; with both, the node's own transactions
   still go to Tor peers only.
-- **Tor's port changing while the node runs.** monerod takes `--tx-proxy` once, at start, and
-  this module never restarts the node itself. While the node runs with `--tx-proxy`, the
-  module asks `tor_module.status()` again every 30 s (which also keeps the node listed in the
-  Tor app). If Tor reports a port other than the one in use, `txProxyRestart` turns true,
-  `txProxyReason` names the new port, and payments wait until the node is restarted. Nothing
-  goes out in the clear meanwhile.
+- **Following Tor's port.** monerod reads `--tx-proxy` once, at start, so when Tor's port
+  moves this module restarts the node there itself: stop, then start on the same network with
+  the same settings and the new port. The pool survives that (`tx_pool.cpp:1891-1914`), so held
+  payments keep waiting, and nothing goes out in the clear.
+  - It hears of the port from tor_module's `status_changed` event, which carries `status()`'s
+    reply, and acts only when `socks` changes. The subscription is taken at the first start
+    with `txProxy` on, arms when tor_module loads, also later, and re-arms after it reloads.
+    Events sent before an arm are lost, so each arm asks `status()` once. `status()` is still
+    asked every 30 s as a fallback, which also keeps the node listed in the Tor app.
+  - A new port restarts the node once it has held for 3 s, so closing and reopening the port
+    gives one restart, and at most once a minute: a later move waits for that minute to end.
+    Until then `txProxyRestart` is true and `txProxyReason` names the port.
+  - A closed port (SOCKS off, tor_module unloaded or not answering) never restarts it: a
+    restart could only fall back to 9250. The node keeps its port and waits, and restarts when
+    a port opens somewhere else. tor_module closes its port on unload without an event, so a
+    lost subscription counts as closed.
+  - Only a node started with `txProxy` on, on mainnet, while it runs; never during a start or
+    stop. A node started at 9250 without tor_module restarts only if Tor comes up elsewhere.
 
 `status()` reports what the running node was started with:
 
@@ -125,9 +138,9 @@ are the Monero tree logos-monero-nix pins (v0.18.5.4, `85f036b`).
 | `txProxy` | `on`: the node was started with `--tx-proxy`, Tor up or not. `off`: `txProxy` is off, or the node is not running |
 | `txProxySocks` | the `IP:PORT` `--tx-proxy` points at; empty when `off` |
 | `txProxyPeers` | outbound Tor connections the node can send through, from `get_connections` (`address_type` 4, within 2 blocks of the node's height, as `levin_notify.cpp:150-151` picks them); -1 when not known yet |
-| `txProxyWaiting` | true while payments cannot leave: no Tor peer, Tor not available, or Tor moved to another port |
+| `txProxyWaiting` | true while payments cannot leave: no Tor peer, Tor not available, or a restart onto Tor's new port pending |
 | `txProxyReason` | a sentence saying why, while waiting; empty otherwise |
-| `txProxyRestart` | true when Tor reports another port than the one in use: a restart puts it in effect |
+| `txProxyRestart` | true while the node waits to restart onto the port Tor moved to: 3 s, or up to a minute after the last automatic restart |
 
 `peersOut` counts clearnet outbound connections only (`core_rpc_server.cpp:530`); Tor ones
 are in `txProxyPeers`.
@@ -145,8 +158,10 @@ committed height: the chain is LMDB, which is crash-safe.
 ## Tests
 
 `nix build .#unit-tests` runs `tests/`: the settings, monerod's argv, the parsing of
-`tor_module`'s reply and the `txProxy` status fields, with `monerod_c` mocked out. `doctests/`
-runs the module under logosctl.
+`tor_module`'s reply, the `txProxy` status fields, and when a moved port restarts the node, fed
+mocked `status_changed` events on a clock the tests move, with `monerod_c` mocked out.
+`doctests/` runs the module under logosctl, with tor_module: it moves Tor's port with
+`set_socks` while an offline mainnet node runs and checks that the node follows it.
 
 `tools/held-payment/run.sh` (about 20 minutes, not in CI) shows that a payment held while Tor
 is down does not reach a clearnet peer, before or after a restart. A wallet sends through a

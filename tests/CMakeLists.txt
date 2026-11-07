@@ -3,14 +3,16 @@ project(MonerodModuleTests LANGUAGES CXX)
 
 include(LogosTest)
 
-# Settings and argv only: monerod_settings.cpp needs neither the node nor IPC.
+# Settings, argv and following Tor's port: neither needs the node nor IPC.
 logos_test(
     NAME monerod_module_tests
     MODULE_SOURCES
         ../src/monerod_settings.cpp
+        ../src/tor_follow.cpp
     TEST_SOURCES
         main.cpp
         settings_test.cpp
+        tor_follow_test.cpp
     EXTRA_INCLUDES
         ../src
 )

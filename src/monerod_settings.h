@@ -48,9 +48,10 @@ struct TxProxyState {
     std::string reason;
 };
 
-// For a node started with --tx-proxy at `inUse`: whether payments are held, and why. `torSocks`
-// is tor_module's port at the last poll ("" with `torWhy` when it gave none); `peers` as torPeers().
-TxProxyState txProxyState(const std::string& inUse, const std::string& torSocks,
-                          const std::string& torWhy, int peers);
+// For a node running with --tx-proxy: whether payments are held, and why. `torSocks` is
+// tor_module's port as last seen ("" with `torWhy` when it gave none); `peers` as torPeers();
+// `restartTo` the port a pending automatic restart moves to, due in `restartInSecs`.
+TxProxyState txProxyState(const std::string& torSocks, const std::string& torWhy, int peers,
+                          const std::string& restartTo, int64_t restartInSecs);
 
 }  // namespace monerod

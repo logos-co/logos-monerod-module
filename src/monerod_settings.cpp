@@ -163,13 +163,15 @@ int torPeers(const json& connections, uint64_t height) {
     return n;
 }
 
-TxProxyState txProxyState(const std::string& inUse, const std::string& torSocks,
-                          const std::string& torWhy, int peers) {
+TxProxyState txProxyState(const std::string& torSocks, const std::string& torWhy, int peers,
+                          const std::string& restartTo, int64_t restartInSecs) {
     TxProxyState t;
     // monerod takes the address once, at start: a port Tor moved to needs a restart.
-    if (!torSocks.empty() && torSocks != inUse) {
+    if (!restartTo.empty()) {
         t.waiting = t.restart = true;
-        t.reason = "Tor moved to " + torSocks + ". Restart the node to use it; until then payments wait in the node.";
+        t.reason = "Tor moved to " + restartTo + "; the node restarts "
+                   + (restartInSecs > 5 ? "in about " + std::to_string(restartInSecs) + " s" : "in a few seconds")
+                   + " to use it.";
     } else if (torSocks.empty() && peers <= 0) {
         t.waiting = true;
         t.reason = "Tor is not available: " + torWhy + ". Payments wait in the node until it is and a Tor peer connects.";

@@ -13,7 +13,10 @@
 #include <logos_module_context.h>
 #include <logos_result.h>
 
-namespace logos { class LpClient; }
+#include "tor_follow.h"
+
+namespace logos { class LpClient; class LpSubscription; }
+struct MonerodTorFeed;
 
 /// A Monero node running in-process through libmonerod_c. One node at a time; its
 /// lifetime is this module's lifetime.
@@ -34,6 +37,7 @@ public:
 
     /// Start the node for `network`. Returns once its thread is running. With `txProxy` on it
     /// always starts with --tx-proxy: at tor_module's SOCKS port, or its default 127.0.0.1:9250.
+    /// It then follows that port: when tor_module reports another one, the node restarts there.
     StdLogosResult start(const std::string& network);
 
     /// Stop the node and wait for it to shut down.
@@ -54,7 +58,8 @@ public:
     /// with no peers, so it is the only field separating a stalled chain from a current one.
     /// `txProxy` is "on" when the running node was started with --tx-proxy ("off" while stopped);
     /// `txProxyPeers`, its outbound Tor connections (-1 unknown); `txProxyWaiting`, true while its
-    /// payments cannot leave, `txProxyReason` saying why; `txProxyRestart`, Tor has moved port.
+    /// payments cannot leave, `txProxyReason` saying why; `txProxyRestart`, true while a restart
+    /// onto the port Tor moved to is pending.
     LogosMap status();
 
     /// Loopback RPC URL the node serves for `network`.
@@ -80,8 +85,15 @@ private:
     void resetChain();
     nlohmann::json askTor(std::string& why);
     void pollTor();
+    void watchTor();
+    void torSeen(const std::string& socks, const std::string& why);
+    bool followingTor();
+    void followTor();
+    bool restartTor();
 
     std::mutex m_mutex;
+    // Held through start(), stop(), an automatic restart and the unload's stop: one at a time.
+    std::mutex m_lifeMutex;
     std::thread m_stopThread;
     std::string m_persistDir;
     std::string m_logFile;
@@ -101,11 +113,18 @@ private:
 
     // What the running node was started with (guarded by m_chainMutex)...
     bool m_txOn = false;
-    std::string m_txSocks;
-    // ...tor_module's SOCKS port as last asked, and the node's Tor peers (also guarded).
+    std::string m_txSocks, m_runNetwork, m_runLog;
+    nlohmann::json m_runSettings;
+    bool m_unloading = false;
+    // ...tor_module's SOCKS port as last seen, and the node's Tor peers (also guarded).
     std::string m_torSocks, m_torWhy;
     std::chrono::steady_clock::time_point m_torAskedAt;
     int m_torPeers = -1;
+    monerod::TorFollow m_follow;                       // guarded by m_chainMutex
+    std::thread m_followThread;
+    std::condition_variable m_followWake;
     std::mutex m_torMutex;
     logos::LpClient* m_tor = nullptr;                  // guarded by m_torMutex
+    std::unique_ptr<logos::LpSubscription> m_torSub;   // guarded by m_torMutex
+    std::shared_ptr<MonerodTorFeed> m_feed;
 };

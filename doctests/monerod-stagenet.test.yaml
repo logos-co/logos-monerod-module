@@ -24,11 +24,12 @@ sections:
           set -eu
           nix build 'github:logos-co/logos-logoscore-cli{release}#ctl-bundle-dir' --out-link ./logos
           nix build 'github:logos-co/logos-monerod-module{release}#install-portable' --no-write-lock-file -o result-monerod
-          ls result-monerod/modules/monerod_module
+          nix build 'github:logos-co/logos-tor-module/8a2ff25e6229293431293d31ed50b3f3bc1dfebc#install-portable' -o result-tor
+          ls result-monerod/modules/monerod_module result-tor/modules
         code_block: |
           nix build 'github:logos-co/logos-logoscore-cli#ctl-bundle-dir' --out-link ./logos
           nix build 'github:logos-co/logos-monerod-module#install-portable' -o result-monerod
-        expect_contains: ["monerod_module_plugin", "LICENSE.monero", "LICENSE.monero_c"]
+        expect_contains: ["monerod_module_plugin", "LICENSE.monero", "LICENSE.monero_c", "tor_module"]
 
   - title: "Run a stagenet node in the module host"
     steps:
@@ -86,3 +87,78 @@ sections:
           - '"txProxySocks":"127.0.0.1:9250"'
           - '"txProxyWaiting":true'
           - '"txProxyReason":"Tor is not available: tor_module is not loaded. Payments wait in the node until it is and a Tor peer connects."'
+
+      - title: "The node follows tor_module's SOCKS port and restarts on its own when it moves"
+        # Offline node on spare ports. tor_module starts Tor once the node asks its status, so it
+        # dials the Tor network, but nothing here needs it joined: only the port it reports.
+        run: |
+          set -eu
+          export LOGOSCTL_CONFIG_DIR="$PWD/session-follow"
+          rm -rf "$LOGOSCTL_CONFIG_DIR" chain-follow; mkdir -p "$LOGOSCTL_CONFIG_DIR" home chain-follow
+          printf 'modules_dirs: [%s, %s]\n' "$PWD/result-monerod/modules" "$PWD/result-tor/modules" \
+            | ./logos/bin/logosctl daemon config set - > /dev/null
+          HOME="$PWD/home" ./logos/bin/logosctl daemon start --detach
+          trap './logos/bin/logosctl daemon stop > /dev/null 2>&1 || true' EXIT
+          ctl() { ./logos/bin/logosctl "$@"; }
+          field() { grep -oE "\"$1\":(\"[^\"]*\"|[^,}]*)" | head -1; }
+          show() { s=$(ctl call monerod_module status); echo "$1: $(for k in state txProxySocks txProxyRestart uptimeSecs txProxyReason; do echo "$s" | field $k; done | tr '\n' ' ')"; }
+          # Polls status() until the node runs at $1, for up to $2 s.
+          until_at() {
+            for _ in $(seq 1 "$2"); do
+              case "$(ctl call monerod_module status)" in *'"state":"running"'*"\"txProxySocks\":\"$1\""*) return 0;; esac
+              sleep 1
+            done
+            return 1
+          }
+          # tor_module lets only the Tor app call set_socks; callers.json in its data dir admits this shell.
+          ctl module load tor_module > /dev/null
+          tor_dir=$(ls -d "$LOGOSCTL_CONFIG_DIR"/data/tor_module/*)
+          ctl module unload tor_module > /dev/null
+          printf '{"allowHost":true}\n' > "$tor_dir/callers.json"
+          printf '{"version":1,"socks":{"enabled":true,"address":"127.0.0.1:18994"}}\n' > "$tor_dir/settings.json"
+
+          ctl module load monerod_module > /dev/null
+          ctl call monerod_module configure mainnet \
+            "json:{\"offline\":true,\"rpcBindPort\":18991,\"p2pBindPort\":18990,\"dataDir\":\"$PWD/chain-follow\"}" > /dev/null
+          ctl call monerod_module start mainnet > /dev/null
+          show "started, tor_module not loaded"
+
+          loaded=$(date +%s)
+          ctl module load tor_module > /dev/null
+          until_at 127.0.0.1:18994 40 && show "tor_module loaded on 18994"
+          # Under 20 s is the event; the 30 s poll alone would take longer.
+          [ $(( $(date +%s) - loaded )) -lt 20 ] && echo "followed by tor_module's event"
+
+          ctl call tor_module set_socks true 127.0.0.1:18995 > /dev/null
+          sleep 1
+          show "moved within a minute of the last restart"
+          until_at 127.0.0.1:18995 90 && show "followed to 18995"
+
+          ctl call tor_module set_socks false 127.0.0.1:18995 > /dev/null
+          sleep 6
+          show "port off"
+          ctl call tor_module set_socks true 127.0.0.1:18995 > /dev/null
+          sleep 6
+          show "port back where it was"
+          ctl module unload tor_module > /dev/null
+          sleep 6
+          show "tor_module unloaded"
+          ctl module load tor_module > /dev/null
+          sleep 8
+          show "tor_module loaded again"
+          up=$(ctl call monerod_module status | grep -oE '"uptimeSecs":[0-9]+' | cut -d: -f2)
+          [ "$up" -ge 20 ] && echo "no restart since the move to 18995"
+          ctl call monerod_module stop > /dev/null
+        expect_contains:
+          - 'started, tor_module not loaded: "state":"running" "txProxySocks":"127.0.0.1:9250"'
+          - 'tor_module loaded on 18994: "state":"running" "txProxySocks":"127.0.0.1:18994"'
+          - "followed by tor_module's event"
+          - 'moved within a minute of the last restart: "state":"running" "txProxySocks":"127.0.0.1:18994" "txProxyRestart":true'
+          - '"txProxyReason":"Tor moved to 127.0.0.1:18995; the node restarts in about'
+          - 'followed to 18995: "state":"running" "txProxySocks":"127.0.0.1:18995" "txProxyRestart":false'
+          - "port off: \"state\":\"running\" \"txProxySocks\":\"127.0.0.1:18995\" \"txProxyRestart\":false"
+          - "Tor is not available: Tor's SOCKS port is off in the Tor app."
+          - 'tor_module unloaded: "state":"running" "txProxySocks":"127.0.0.1:18995" "txProxyRestart":false'
+          - 'Tor is not available: tor_module stopped.'
+          - 'tor_module loaded again: "state":"running" "txProxySocks":"127.0.0.1:18995" "txProxyRestart":false'
+          - 'no restart since the move to 18995'

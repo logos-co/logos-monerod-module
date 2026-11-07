@@ -147,29 +147,32 @@ LOGOS_TEST(tor_peers_counts_outbound_tor_near_the_tip) {
 
 LOGOS_TEST(tx_proxy_state_waits_and_says_why) {
     const std::string at = "127.0.0.1:9250";
-    auto st = monerod::txProxyState(at, at, "", 2);
+    auto st = monerod::txProxyState(at, "", 2, "", 0);
     LOGOS_ASSERT_FALSE(st.waiting);
     LOGOS_ASSERT_EQ(st.reason, std::string());
-    st = monerod::txProxyState(at, at, "", -1);          // not counted yet
+    st = monerod::txProxyState(at, "", -1, "", 0);          // not counted yet
     LOGOS_ASSERT_FALSE(st.waiting);
-    st = monerod::txProxyState(at, at, "", 0);
+    st = monerod::txProxyState(at, "", 0, "", 0);
     LOGOS_ASSERT_TRUE(st.waiting);
     LOGOS_ASSERT_FALSE(st.restart);
     LOGOS_ASSERT_EQ(st.reason, std::string("No Tor peer yet. Payments wait in the node until one connects."));
     for (int peers : {0, -1}) {
-        st = monerod::txProxyState(at, "", "tor_module is not loaded", peers);
+        st = monerod::txProxyState("", "tor_module is not loaded", peers, "", 0);
         LOGOS_ASSERT_TRUE(st.waiting);
         LOGOS_ASSERT_EQ(st.reason, std::string("Tor is not available: tor_module is not loaded. "
                                                "Payments wait in the node until it is and a Tor peer connects."));
     }
     // Something else serves the port and the node has Tor peers through it.
-    st = monerod::txProxyState(at, "", "tor_module is not loaded", 3);
+    st = monerod::txProxyState("", "tor_module is not loaded", 3, "", 0);
     LOGOS_ASSERT_FALSE(st.waiting);
+    // A pending automatic restart, whatever the peers.
     for (int peers : {-1, 0, 2}) {
-        st = monerod::txProxyState(at, "127.0.0.1:41234", "", peers);
+        st = monerod::txProxyState("127.0.0.1:41234", "", peers, "127.0.0.1:41234", 3);
         LOGOS_ASSERT_TRUE(st.waiting);
         LOGOS_ASSERT_TRUE(st.restart);
-        LOGOS_ASSERT_EQ(st.reason, std::string("Tor moved to 127.0.0.1:41234. Restart the node to use it; "
-                                               "until then payments wait in the node."));
+        LOGOS_ASSERT_EQ(st.reason, std::string("Tor moved to 127.0.0.1:41234; the node restarts in a few seconds "
+                                               "to use it."));
     }
+    st = monerod::txProxyState("127.0.0.1:41234", "", 2, "127.0.0.1:41234", 42);
+    LOGOS_ASSERT_EQ(st.reason, std::string("Tor moved to 127.0.0.1:41234; the node restarts in about 42 s to use it."));
 }

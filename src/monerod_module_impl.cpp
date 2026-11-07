@@ -164,8 +164,9 @@ void MonerodModuleImpl::pollTor() {
         m_torAskedAt = std::chrono::steady_clock::now();
     }
     std::string why;
+    const int64_t asked = torEvents();
     const json reply = askTor(why);
-    torSeen(why.empty() ? monerod::torSocks(reply, why) : "", why);
+    torSeen(why.empty() ? monerod::torSocks(reply, why) : "", why, asked);
 }
 
 // Subscribes once. The subscription arms when tor_module loads, also later, and re-arms after it
@@ -176,9 +177,9 @@ void MonerodModuleImpl::watchTor() {
     if (!m_tor) m_tor = &modules().dynamic("tor_module");
     logos::LpClient* tor = m_tor;
     const std::shared_ptr<MonerodTorFeed> feed = m_feed;
-    auto seen = [feed](const std::string& socks, const std::string& why) {
+    auto seen = [feed](const std::string& socks, const std::string& why, int64_t asked = -1) {
         std::lock_guard<std::mutex> l(feed->m);
-        if (feed->self) feed->self->torSeen(socks, why);
+        if (feed->self) feed->self->torSeen(socks, why, asked);
     };
     m_torSub = std::make_unique<logos::LpSubscription>(tor->subscribe("status_changed", [seen](json args) {
         if (!args.is_array() || args.empty()) return;
@@ -190,29 +191,39 @@ void MonerodModuleImpl::watchTor() {
     tor->onSubscriptionStatus([seen, feed, tor](logos::SubStatus st, std::uint64_t) {
         // Unloaded or gone: its port closed with no event (Service::stop sends none).
         if (st != logos::SubStatus::Armed) return seen("", "tor_module stopped");
+        int64_t asked = 0;
         {
             std::lock_guard<std::mutex> l(feed->m);
             if (!feed->self || !feed->self->followingTor()) return;
+            asked = feed->self->torEvents();
         }
-        tor->invokeAsyncResult("status", json::array(), [seen](json v, const logos::CallError& e) {
+        tor->invokeAsyncResult("status", json::array(), [seen, asked](json v, const logos::CallError& e) {
             std::string why = e.ok() ? "" : "tor_module: " + (e.message.empty() ? e.code : e.message);
             const std::string socks = why.empty() ? monerod::torSocks(v, why) : "";
-            seen(socks, why);
+            seen(socks, why, asked);
         }, kTorBudgetMs);
     });
 }
 
 // Every sighting of tor_module's port lands here: an event, an answer to status(), a lost
 // subscription.
-void MonerodModuleImpl::torSeen(const std::string& socks, const std::string& why) {
+void MonerodModuleImpl::torSeen(const std::string& socks, const std::string& why, int64_t asked) {
     bool changed = false;
     {
         std::lock_guard<std::mutex> lock(m_chainMutex);
+        // An event that landed while this answer was on its way is newer: the answer is stale.
+        if (asked >= 0 && asked != m_torEvents) return;
+        if (asked < 0) ++m_torEvents;
         m_torSocks = socks;
         m_torWhy = why;
         changed = m_follow.observe(socks, monerod::Clock::now());
     }
     if (changed) m_followWake.notify_all();
+}
+
+int64_t MonerodModuleImpl::torEvents() {
+    std::lock_guard<std::mutex> lock(m_chainMutex);
+    return m_torEvents;
 }
 
 bool MonerodModuleImpl::followingTor() {

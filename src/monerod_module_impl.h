@@ -86,7 +86,9 @@ private:
     nlohmann::json askTor(std::string& why);
     void pollTor();
     void watchTor();
-    void torSeen(const std::string& socks, const std::string& why);
+    // `asked`: for an answer to status(), torEvents() when it was asked; -1 for an event.
+    void torSeen(const std::string& socks, const std::string& why, int64_t asked = -1);
+    int64_t torEvents();
     bool followingTor();
     void followTor();
     bool restartTor();
@@ -118,6 +120,7 @@ private:
     bool m_unloading = false;
     // ...tor_module's SOCKS port as last seen, and the node's Tor peers (also guarded).
     std::string m_torSocks, m_torWhy;
+    int64_t m_torEvents = 0;                           // events and lost subscriptions seen
     std::chrono::steady_clock::time_point m_torAskedAt;
     int m_torPeers = -1;
     monerod::TorFollow m_follow;                       // guarded by m_chainMutex

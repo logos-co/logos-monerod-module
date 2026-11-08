@@ -23,6 +23,8 @@
           input = logos-monero-nix;
           packages.default = "monerod-c";
         };
+        # The tests cover monerod_settings.cpp alone, so monerod_c is never built for them.
+        tests = { dir = ./tests; mockCLibs = [ "monerod_c" ]; };
       };
     in
     { packages = lib.genAttrs systems (system: module.packages.${system}); };
